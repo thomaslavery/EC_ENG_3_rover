@@ -5,7 +5,14 @@
  *   1. Power on -> WAIT (red LED blinks, motors off). Uses the fixed calibration below.
  *   2. Press any front bumper -> ARMED (green LED). Car waits ARM_DELAY_MS so your
  *      hand is clear, then starts TRACKING.
- *   3. Car stops when it sees the solid black crossbar (or if a bumper is hit).
+ *   3. Car stops when it sees the solid black crossbar.
+ *
+ * LEDs (to tell why it stopped):
+ *   red LED1 (P1.0) blinking fast  - tracking loop is running (heartbeat)
+ *   RGB green solid                - stopped: saw the crossbar (thinks it's black)
+ *   RGB red blinking               - back in WAIT, i.e. the board reset (brownout?)
+ *   heartbeat frozen, no green     - the code hung
+ * Once stopped, Serial (9600) prints the reason and the last sensor reading every 1 s.
  *
  * Sign convention: error > 0 means the line is to the RIGHT of center, and the car
  * turns right (left wheel faster).
@@ -70,6 +77,10 @@ int crossbarCount = 0;
 unsigned long lastLoopUs = 0;
 unsigned long trackStartMs = 0;
 
+enum StopReason { STOP_NONE, STOP_CROSSBAR };
+StopReason stopReason = STOP_NONE;
+unsigned long stopMs = 0;
+
 // ---------------- Helpers ----------------
 void setMotor(int dirPin, int pwmPin, int speed) {
   speed = constrain(speed, -255, 255);
@@ -123,11 +134,14 @@ float readLine() {
   return lastValidError;
 }
 
-void stopCar() {
+void stopCar(StopReason reason) {
   drive(0, 0);
   mode = STOPPED;
+  stopReason = reason;
+  stopMs = millis();
+  digitalWrite(LED1, LOW);
   digitalWrite(RED_LED, LOW);
-  digitalWrite(GREEN_LED, HIGH);
+  digitalWrite(GREEN_LED, reason == STOP_CROSSBAR ? HIGH : LOW);
 }
 
 void printSensors(float error) {
@@ -175,11 +189,7 @@ void trackingStep() {
   unsigned long now = micros();
   if (now - lastLoopUs < LOOP_PERIOD_US) return;
   lastLoopUs = now;
-
-  if (anyBumperPressed()) {  // safety stop
-    stopCar();
-    return;
-  }
+  digitalWrite(LED1, (millis() / 100) % 2);  // heartbeat: blinking = loop still running
 
   float error = readLine();
 
@@ -187,7 +197,7 @@ void trackingStep() {
   if (millis() - trackStartMs > END_IGNORE_MS) {
     crossbarCount = (blackCount >= CROSSBAR_SENSORS) ? crossbarCount + 1 : 0;
     if (crossbarCount >= CROSSBAR_SAMPLES) {
-      stopCar();
+      stopCar(STOP_CROSSBAR);
       return;
     }
   }
@@ -216,6 +226,20 @@ void trackingStep() {
 #endif
 }
 
+// Motors are off; keep reporting why we stopped and what the sensors saw last.
+void stoppedStep() {
+  static unsigned long lastPrint = 0;
+  if (millis() - lastPrint < 1000) return;
+  lastPrint = millis();
+  Serial.print("STOPPED: crossbar");
+  Serial.print("  blackCount=");
+  Serial.print(blackCount);
+  Serial.print("  after ");
+  Serial.print(stopMs - trackStartMs);
+  Serial.println(" ms of tracking");
+  printSensors(lastValidError);
+}
+
 void setup() {
   ECE3_Init();
   Serial.begin(9600);
@@ -234,6 +258,7 @@ void setup() {
 
   pinMode(RED_LED, OUTPUT);
   pinMode(GREEN_LED, OUTPUT);
+  pinMode(LED1, OUTPUT);
 
   Serial.println("Ready: press a bumper to start.");
 }
@@ -243,6 +268,6 @@ void loop() {
     case WAIT:     waitStep();     break;
     case ARMED:    armedStep();    break;
     case TRACKING: trackingStep(); break;
-    case STOPPED:  break;
+    case STOPPED:  stoppedStep();  break;
   }
 }

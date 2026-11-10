@@ -7,7 +7,11 @@
  *   1. Power on -> motors off. Serial (9600) prints the sensors as a pattern like
  *      "L ...##... R" so you can check the threshold by sliding the car over the line.
  *   2. Press any bumper -> 1 s pause -> follows the line.
- *   3. Stops when (almost) every sensor sees black (end crossbar), or on a bumper hit.
+ *   3. Stops when (almost) every sensor sees black (end crossbar).
+ *
+ * LEDs: red LED1 blinking fast = running, RGB green = stopped on crossbar,
+ * RGB red solid = board reset (back waiting for bumper),
+ * heartbeat frozen with no green = code hung.
  */
 
 #include <ECE3.h>
@@ -78,6 +82,7 @@ void setup() {
   for (int i = 0; i < 6; i++) pinMode(BUMPERS[i], INPUT_PULLUP);
   pinMode(RED_LED, OUTPUT);
   pinMode(GREEN_LED, OUTPUT);
+  pinMode(LED1, OUTPUT);
 
   // Wait for a bumper press, showing the sensor pattern meanwhile
   digitalWrite(RED_LED, HIGH);
@@ -92,11 +97,7 @@ void setup() {
 }
 
 void loop() {
-  if (anyBumperPressed()) {
-    drive(0, 0);
-    digitalWrite(GREEN_LED, HIGH);
-    while (true) {}  // stopped for good, press reset to run again
-  }
+  digitalWrite(LED1, (millis() / 100) % 2);  // heartbeat: blinking = loop still running
 
   readSensors();
 
@@ -110,8 +111,9 @@ void loop() {
   else crossbarCount = 0;
   if (crossbarCount >= 3) {
     drive(0, 0);
-    digitalWrite(GREEN_LED, HIGH);
-    while (true) {}
+    digitalWrite(LED1, LOW);
+    digitalWrite(GREEN_LED, HIGH);  // green = stopped by crossbar
+    while (true) {}  // stopped for good, press reset to run again
   }
 
   // Pick a steering level from the outermost black sensor.
