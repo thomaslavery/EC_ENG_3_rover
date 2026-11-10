@@ -7,7 +7,16 @@
  *   1. Power on -> WAIT (red LED blinks, motors off). Uses the fixed calibration below.
  *   2. Press any front bumper -> ARMED (green LED). Car waits ARM_DELAY_MS so your
  *      hand is clear, then starts TRACKING.
- *   3. Car stops when it sees the solid black crossbar (or if a bumper is hit).
+ *   3. At the first crossbar (end of track) it spins 180 deg and follows the line back.
+ *   4. At the next crossbar (start of track) it stops.
+ *
+ * LEDs (to tell why it stopped):
+ *   red LED1 (P1.0) blinking fast  - tracking loop is running (heartbeat)
+ *   RGB blue solid                 - spinning 180 or on the return leg
+ *   RGB green solid                - stopped: saw the second crossbar
+ *   RGB red blinking               - back in WAIT, i.e. the board reset (brownout?)
+ *   heartbeat frozen, no green     - the code hung
+ * Once stopped, Serial (9600) prints the reason and the last sensor reading every 1 s.
  *
  * Sign convention: error > 0 means the line is to the RIGHT of center, and the car
  * turns right (left wheel faster).
@@ -20,8 +29,10 @@
 #define DEBUG 0
 
 // ---------------- Tunables ----------------
-const int   BASE_SPEED   = 50;     // PWM (0-255), constant
-const float KP           = 0.015;  // per unit error (error range is -3500..3500)
+const int   BASE_PENALTY = 50;
+const int   PENALTY_COEF = 1.5;
+const int   BASE_SPEED   = 50 + PENALTY_COEF * BASE_PENALTY;     // PWM (0-255), constant
+const float KP           = 0.03;  // per unit error (error range is -3500..3500)
 const int   ERROR_SIGN   = 1;      // flip to -1 if the car steers away from the line
 
 const unsigned long LOOP_PERIOD_US = 5000;  // control loop runs every 5 ms
@@ -32,6 +43,12 @@ const int LOST_THRESHOLD   = 200;  // all sensors below this (0-1000) = line los
 const int BLACK_THRESHOLD  = 700;  // sensor above this counts as black for crossbar
 const int CROSSBAR_SENSORS = 7;    // this many black sensors = crossbar
 const int CROSSBAR_SAMPLES = 3;    // for this many consecutive samples
+
+const int  TURN_SPEED      = 70;   // PWM for each wheel during the 180 deg spin
+const long TURN_MIN_COUNTS = 300;  // encoder counts per wheel before looking for the line (~150 deg)
+const long TURN_MAX_COUNTS = 450;  // stop looking and go back to tracking (~225 deg)
+const unsigned long TURN_PAUSE_MS   = 200;   // settle before and after the spin
+const unsigned long TURN_TIMEOUT_MS = 4000;  // in case the wheels stall or an encoder is dead
 
 // ---------------- Fixed calibration (raw IR values, sensor 0 = rightmost) ----------------
 const uint16_t minVal[8] = {978, 680, 794, 657, 702, 711, 862, 885};
@@ -52,7 +69,7 @@ const int RIGHT_PWM  = 39;  // P2.6
 const int BUMPERS[6] = {24, 25, 6, 27, 8, 28};  // P4.0, P4.2, P4.3, P4.5, P4.6, P4.7 (active LOW)
 
 // ---------------- State ----------------
-enum Mode { WAIT, ARMED, TRACKING, STOPPED };
+enum Mode { WAIT, ARMED, TRACKING, TURNING, STOPPED };
 Mode mode = WAIT;
 
 uint16_t raw[8];
@@ -66,6 +83,12 @@ float lastValidError = 0;
 int crossbarCount = 0;
 unsigned long lastLoopUs = 0;
 unsigned long trackStartMs = 0;
+bool returning = false;  // false = heading to the end bar, true = heading back to the start
+unsigned long turnStartMs = 0;
+
+enum StopReason { STOP_NONE, STOP_CROSSBAR };
+StopReason stopReason = STOP_NONE;
+unsigned long stopMs = 0;
 
 // ---------------- Helpers ----------------
 void setMotor(int dirPin, int pwmPin, int speed) {
@@ -120,11 +143,15 @@ float readLine() {
   return lastValidError;
 }
 
-void stopCar() {
+void stopCar(StopReason reason) {
   drive(0, 0);
   mode = STOPPED;
+  stopReason = reason;
+  stopMs = millis();
+  digitalWrite(LED1, LOW);
   digitalWrite(RED_LED, LOW);
-  digitalWrite(GREEN_LED, HIGH);
+  digitalWrite(BLUE_LED, LOW);
+  digitalWrite(GREEN_LED, reason == STOP_CROSSBAR ? HIGH : LOW);
 }
 
 void printSensors(float error) {
@@ -166,31 +193,68 @@ void armedStep() {
   mode = TRACKING;
 }
 
+// Hit the end bar: settle, then spin left in place.
+void startTurn() {
+  drive(0, 0);
+  digitalWrite(BLUE_LED, HIGH);
+  delay(TURN_PAUSE_MS);
+  resetEncoderCount_left();
+  resetEncoderCount_right();
+  drive(-TURN_SPEED, TURN_SPEED);
+  turnStartMs = millis();
+  lastLoopUs = micros();
+  mode = TURNING;
+}
+
+void finishTurn() {
+  drive(0, 0);
+  delay(TURN_PAUSE_MS);
+  returning = true;
+  lastValidError = -1;  // if the line isn't under us yet, keep turning left to find it
+  crossbarCount = 0;
+  trackStartMs = millis();
+  lastLoopUs = micros();
+  mode = TRACKING;
+}
+
+void turningStep() {
+  unsigned long now = micros();
+  if (now - lastLoopUs < LOOP_PERIOD_US) return;
+  lastLoopUs = now;
+  digitalWrite(LED1, (millis() / 100) % 2);  // heartbeat: blinking = loop still running
+
+  readLine();
+  long turned = (labs(getEncoderCount_left()) + labs(getEncoderCount_right())) / 2;
+  bool lineCentered = norm[3] > BLACK_THRESHOLD || norm[4] > BLACK_THRESHOLD;
+
+  if ((turned >= TURN_MIN_COUNTS && lineCentered) || turned >= TURN_MAX_COUNTS ||
+      millis() - turnStartMs > TURN_TIMEOUT_MS) {
+    finishTurn();
+  }
+}
+
 void trackingStep() {
   unsigned long now = micros();
   if (now - lastLoopUs < LOOP_PERIOD_US) return;
   lastLoopUs = now;
-
-  if (anyBumperPressed()) {  // safety stop
-    stopCar();
-    return;
-  }
+  digitalWrite(LED1, (millis() / 100) % 2);  // heartbeat: blinking = loop still running
 
   float error = readLine();
 
-  // End-of-track crossbar
+  // Crossbar: spin around at the end of the track, stop when back at the start
   if (millis() - trackStartMs > END_IGNORE_MS) {
     crossbarCount = (blackCount >= CROSSBAR_SENSORS) ? crossbarCount + 1 : 0;
     if (crossbarCount >= CROSSBAR_SAMPLES) {
-      stopCar();
+      if (returning) stopCar(STOP_CROSSBAR);
+      else startTurn();
       return;
     }
   }
 
   float u = KP * error;
 
-  int left  = BASE_SPEED + (int)u;  // line to the right (error > 0) -> left wheel faster
-  int right = BASE_SPEED - (int)u;
+  int left  = BASE_SPEED - PENALTY_COEF * abs(u) + (int)u;
+  int right = BASE_SPEED - PENALTY_COEF * abs(u) - (int)u;
   drive(left, right);
 
 #if DEBUG
@@ -203,6 +267,20 @@ void trackingStep() {
     Serial.print(" R="); Serial.println(right);
   }
 #endif
+}
+
+// Motors are off; keep reporting why we stopped and what the sensors saw last.
+void stoppedStep() {
+  static unsigned long lastPrint = 0;
+  if (millis() - lastPrint < 1000) return;
+  lastPrint = millis();
+  Serial.print("STOPPED: crossbar");
+  Serial.print("  blackCount=");
+  Serial.print(blackCount);
+  Serial.print("  after ");
+  Serial.print(stopMs - trackStartMs);
+  Serial.println(" ms of the return leg");
+  printSensors(lastValidError);
 }
 
 void setup() {
@@ -223,6 +301,8 @@ void setup() {
 
   pinMode(RED_LED, OUTPUT);
   pinMode(GREEN_LED, OUTPUT);
+  pinMode(BLUE_LED, OUTPUT);
+  pinMode(LED1, OUTPUT);
 
   Serial.println("Ready: press a bumper to start.");
 }
@@ -232,6 +312,7 @@ void loop() {
     case WAIT:     waitStep();     break;
     case ARMED:    armedStep();    break;
     case TRACKING: trackingStep(); break;
-    case STOPPED:  break;
+    case TURNING:  turningStep();  break;
+    case STOPPED:  stoppedStep();  break;
   }
 }
