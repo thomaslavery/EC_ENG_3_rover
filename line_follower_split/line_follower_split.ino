@@ -15,8 +15,9 @@
  * since the car drives the same HALF2 stretch back with the same tuning. With
  * AUTO_SPLIT_RET = 0 it uses SPLIT_RET_MS.
  *
- * Return leg on HALF1: the slowdown kicks in at RET_HALF1_PENALTY_ATTACK (1.0 = at once)
- * instead of PENALTY_ATTACK, so the car slows and turns tighter right away in the folds.
+ * Return leg on HALF1: uses the RET_HALF1 tuning instead of HALF1, and the slowdown
+ * kicks in at RET_HALF1_PENALTY_ATTACK (1.0 = at once) instead of PENALTY_ATTACK, so the
+ * car slows and turns tighter right away in the folds.
  *
  * Setting the split times: run once and read Serial after it stops. It prints how long
  * each leg took; start with each split at about half of that leg's time.
@@ -64,15 +65,17 @@ struct Tuning {
 
 // Both start as the line_follower.ino tuning: base = 100 + PENALTY_COEF * 50.
 //                       baseSpeed          penaltyCoef  kp    kd
-const Tuning HALF1 = { 45 + 1.8 * 50,      1.8,         0.04, 0.15 };  // start bar -> middle
+const Tuning HALF1 = { 80 + 1.8 * 50,      1.8,         0.032, 0.15 };  // start bar -> middle
 const Tuning HALF2 = { 140 + 1.6 * 50,      1.6,         0.04, 0.3 };  // middle -> end bar
+// Return leg only: used instead of HALF1 once the return switches back (middle -> start bar)
+const Tuning RET_HALF1 = { 60 + 1.8 * 50,  1.8,         0.05, 0.15 };
 
 // ms from the start of each leg to the middle of the track
 const unsigned long SPLIT_OUT_MS = 5800;  // outbound: switch HALF1 -> HALF2
 const unsigned long SPLIT_RET_MS = 8000;  // return (timed from the end of the 180): HALF2 -> HALF1
                                           // only used when AUTO_SPLIT_RET = 0
 #define AUTO_SPLIT_RET 1                  // 1 = return split from the outbound HALF2 time
-const unsigned long RET_SPLIT_EARLY_MS = 500;  // switch back to HALF1 this much earlier than
+const unsigned long RET_SPLIT_EARLY_MS = 200;  // switch back to HALF1 this much earlier than
                                                // the outbound HALF2 time (safety margin)
 
 
@@ -376,7 +379,7 @@ void trackingStep() {
 
   // Pick this half's tuning
   bool half2 = onHalf2();
-  const Tuning &t = half2 ? HALF2 : HALF1;
+  const Tuning &t = half2 ? HALF2 : (returning ? RET_HALF1 : HALF1);
   digitalWrite(RED_LED, half2 ? HIGH : LOW);
 
 
